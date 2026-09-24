@@ -157,6 +157,52 @@ def parse_generate_response(raw: bytes) -> dict[str, Any]:
     return payload
 
 
+def _parse_sampler_head(
+    choice: Mapping, completion_ids: list[int]
+) -> tuple[list[list[int]], list[list[float]]]:
+    ids, logps = [], []
+    content = choice["logprobs"]["content"]
+    if len(content) != len(completion_ids):
+        raise MalformedGenerateResponseError(
+            "Sampler head rows do not align with completion tokens"
+        )
+    for entry in content:
+        row_ids, row_logps = [], []
+        for alternative in entry.get("top_logprobs") or []:
+            token = alternative.get("token", "")
+            if not token.startswith("token_id:") or not token[9:].isdigit():
+                raise MalformedGenerateResponseError(
+                    "Sampler head must contain token_id:<integer> ids"
+                )
+            token_id = int(token[9:])
+            lp = alternative.get("logprob")
+            if (
+                isinstance(lp, bool)
+                or not isinstance(lp, (int, float))
+                or math.isnan(lp)
+                or lp > 0
+            ):
+                raise MalformedGenerateResponseError("Invalid sampler head logprob")
+            if lp == -math.inf:
+                continue
+            if token_id in row_ids:
+                raise MalformedGenerateResponseError("Duplicate sampler head token id")
+            row_ids.append(token_id)
+            row_logps.append(float(lp))
+        if not row_ids or sum(math.exp(lp) for lp in row_logps) > 1.0 + 1e-5:
+            raise MalformedGenerateResponseError(
+                "Missing or unnormalized sampler head probabilities"
+            )
+        sampled = completion_ids[len(ids)]
+        if sampled in row_ids and not math.isclose(
+            row_logps[row_ids.index(sampled)], entry["logprob"], rel_tol=1e-5, abs_tol=1e-5
+        ):
+            raise MalformedGenerateResponseError("Sampler head and sampled-token logprobs disagree")
+        ids.append(row_ids)
+        logps.append(row_logps)
+    return ids, logps
+
+
 def _parse_completion_logprobs(
     choice: Mapping[str, Any], completion_ids: list[int]
 ) -> list[float]:
@@ -310,7 +356,14 @@ async def generate(
 
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
-    sp["logprobs"] = 1
+    score_centering_top_k = sp.pop("score_centering_top_k", None)
+    if score_centering_top_k is not None and (
+        isinstance(score_centering_top_k, bool)
+        or not isinstance(score_centering_top_k, int)
+        or score_centering_top_k < 1
+    ):
+        raise ValueError("score_centering_top_k must be a positive integer")
+    sp["logprobs"] = score_centering_top_k or 1
     sp.setdefault("skip_special_tokens", False)
 
     body: dict[str, Any] = {
@@ -354,6 +407,11 @@ async def generate(
     completion_ids = choice.get("token_ids") or []
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
+    sampler_head_ids = sampler_head_logprobs = None
+    if score_centering_top_k is not None:
+        sampler_head_ids, sampler_head_logprobs = _parse_sampler_head(
+            choice, completion_ids
+        )
 
     parsed = await _maybe_offload(
         renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
@@ -382,6 +440,8 @@ async def generate(
         "prompt_ids": list(prompt_ids),
         "completion_ids": list(completion_ids),
         "completion_logprobs": completion_logprobs,
+        "sampler_head_ids": sampler_head_ids,
+        "sampler_head_logprobs": sampler_head_logprobs,
         "content": parsed.content,
         "reasoning_content": parsed.reasoning_content,
         "tool_calls": parsed.tool_calls,
