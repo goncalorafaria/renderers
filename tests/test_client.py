@@ -5,6 +5,7 @@ import json
 import httpx
 import numpy as np
 import pytest
+
 from renderers import MalformedGenerateResponseError
 from renderers.base import (
     ParsedResponse,
@@ -130,9 +131,16 @@ def _run_generate(client, renderer=None):
         },
     ],
 )
-def test_generate_builds_request_body_and_parses_response(usage):
+@pytest.mark.parametrize("score_centering_top_k", [None, 2])
+def test_generate_builds_request_body_and_parses_response(usage, score_centering_top_k):
     client = _FakeClient()
     client.usage = usage
+    if score_centering_top_k is not None:
+        for entry in client.choice["logprobs"]["content"]:
+            entry["top_logprobs"] = [
+                {"token": entry["token"], "logprob": entry["logprob"]},
+                {"token": "token_id:9", "logprob": -3.0},
+            ]
     renderer = _FakeRenderer()
 
     result = asyncio.run(
@@ -142,7 +150,12 @@ def test_generate_builds_request_body_and_parses_response(usage):
             messages=[{"role": "user", "content": "hi"}],
             model="test-model",
             tools=[{"type": "function", "function": {"name": "echo"}}],
-            sampling_params={"temperature": 0.3, "max_tokens": 7, "min_tokens": 2},
+            sampling_params={
+                "temperature": 0.3,
+                "max_tokens": 7,
+                "min_tokens": 2,
+                "score_centering_top_k": score_centering_top_k,
+            },
             cache_salt="ckpt-42",
         )
     )
@@ -167,7 +180,7 @@ def test_generate_builds_request_body_and_parses_response(usage):
             "max_tokens": 7,
             "min_tokens": 2,
             "stop_token_ids": [99],
-            "logprobs": 1,
+            "logprobs": score_centering_top_k or 1,
             "skip_special_tokens": False,
         },
     }
@@ -179,6 +192,12 @@ def test_generate_builds_request_body_and_parses_response(usage):
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
+    assert result["sampler_head_ids"] == (
+        [[7, 9], [8, 9]] if score_centering_top_k else None
+    )
+    assert result["sampler_head_logprobs"] == (
+        [[-0.1, -3.0], [-0.2, -3.0]] if score_centering_top_k else None
+    )
     assert result["routed_experts"]["shape"] == [2, 1, 1]
     assert isinstance(result["routed_experts"]["data"], memoryview)
     assert result["routed_experts"]["data"].tobytes() == base64.b64encode(b"\x01\x02")
@@ -466,6 +485,7 @@ def test_generate_serializes_multimodal_features_for_qwen_vl_family(
     pytest.importorskip("vllm", reason="vllm needed for features serialization")
 
     import torch as _torch
+
     from renderers.base import (
         MultiModalData,
         PlaceholderRange,
@@ -542,6 +562,7 @@ def test_generate_serializes_multimodal_features_for_gemma4():
     pytest.importorskip("vllm", reason="vllm needed for features serialization")
 
     import torch as _torch
+
     from renderers.base import MultiModalData, PlaceholderRange, load_tokenizer
     from renderers.gemma4 import Gemma4Renderer
 
