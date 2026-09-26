@@ -323,6 +323,31 @@ def test_generate_rejects_non_finite_completion_logprobs(logprob):
         _run_generate(client)
 
 
+def test_generate_drops_masked_sampler_head_entries():
+    # processed_logprobs heads pad past the sampler's kept set with tokens whose
+    # -inf logprob vLLM clamps to the sentinel; those are not sampling support.
+    client = _FakeClient()
+    for entry in client.choice["logprobs"]["content"]:
+        entry["top_logprobs"] = [
+            {"token": entry["token"], "logprob": entry["logprob"]},
+            {"token": "token_id:9", "logprob": -3.0},
+            {"token": "token_id:0", "logprob": -9999.0},
+            {"token": "token_id:1", "logprob": -9999.0},
+        ]
+    result = asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={"score_centering_top_k": 4},
+        )
+    )
+    assert result["sampler_head_ids"] == [[7, 9], [8, 9]]
+    assert result["sampler_head_logprobs"] == [[-0.1, -3.0], [-0.2, -3.0]]
+
+
 def test_generate_rejects_vllm_missing_logprob_sentinel():
     client = _FakeClient()
     client.choice["logprobs"]["content"][0]["logprob"] = -9999.0

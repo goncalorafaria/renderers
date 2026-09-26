@@ -160,7 +160,9 @@ def _parse_sampler_head(
                 or lp > 0
             ):
                 raise MalformedGenerateResponseError("Invalid sampler head logprob")
-            if lp == -math.inf:
+            # Tokens the sampler masked out (top-k/top-p) have processed logprob
+            # -inf, which vLLM serializes clamped to the sentinel.
+            if lp == -math.inf or lp <= VLLM_LOGPROB_SENTINEL:
                 continue
             if token_id in row_ids:
                 raise MalformedGenerateResponseError("Duplicate sampler head token id")
