@@ -182,6 +182,15 @@ def test_generate_builds_request_body_and_parses_response(usage, score_centering
             "stop_token_ids": [99],
             "logprobs": score_centering_top_k or 1,
             "skip_special_tokens": False,
+            **(
+                {
+                    "flat_logprobs": True,
+                    "extra_args": {"pack_sampler_head": True},
+                    "detokenize": False,
+                }
+                if score_centering_top_k
+                else {}
+            ),
         },
     }
     # finish_reason promoted from "stop" → "tool_calls" because the renderer
@@ -321,6 +330,102 @@ def test_generate_rejects_non_finite_completion_logprobs(logprob):
         match=r"content\[0\]\.logprob must be finite",
     ):
         _run_generate(client)
+
+
+def test_generate_drops_masked_sampler_head_entries():
+    # processed_logprobs heads pad past the sampler's kept set with tokens whose
+    # -inf logprob vLLM clamps to the sentinel; those are not sampling support.
+    client = _FakeClient()
+    for entry in client.choice["logprobs"]["content"]:
+        entry["top_logprobs"] = [
+            {"token": entry["token"], "logprob": entry["logprob"]},
+            {"token": "token_id:9", "logprob": -3.0},
+            {"token": "token_id:0", "logprob": -9999.0},
+            {"token": "token_id:1", "logprob": -9999.0},
+        ]
+    result = asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={"score_centering_top_k": 4},
+        )
+    )
+    assert result["sampler_head_ids"] == [[7, 9], [8, 9]]
+    assert result["sampler_head_logprobs"] == [[-0.1, -3.0], [-0.2, -3.0]]
+
+
+def _packed_head(rows):
+    counts = np.array([len(r) for r in rows], dtype=np.int32)
+    ids = np.array([i for r in rows for i, _ in r], dtype=np.int32)
+    logps = np.array([lp for r in rows for _, lp in r], dtype=np.float32)
+
+    def enc(a):
+        return base64.b64encode(a.tobytes()).decode("ascii")
+
+    return {
+        "counts": enc(counts),
+        "ids": enc(ids),
+        "logprobs": enc(logps),
+        "num_positions": len(rows),
+    }
+
+
+def _run_score_centering(client):
+    return asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={"score_centering_top_k": 4},
+        )
+    )
+
+
+def test_generate_reads_packed_sampler_head():
+    client = _FakeClient()
+    # A prime-rl server trims top_logprobs to the sampled token and packs the head.
+    for entry in client.choice["logprobs"]["content"]:
+        entry["top_logprobs"] = [{"token": entry["token"], "logprob": entry["logprob"]}]
+    client.choice["sampler_head"] = _packed_head(
+        [[(7, -0.1), (9, -3.0)], [(8, -0.2), (9, -3.0)]]
+    )
+    result = _run_score_centering(client)
+    assert result["sampler_head_ids"] == [[7, 9], [8, 9]]
+    np.testing.assert_allclose(
+        result["sampler_head_logprobs"], [[-0.1, -3.0], [-0.2, -3.0]], rtol=1e-6
+    )
+    sp = client.calls[0]["body"]["sampling_params"]
+    assert sp["extra_args"] == {"pack_sampler_head": True}
+    assert sp["flat_logprobs"] is True and sp["detokenize"] is False
+
+
+def test_generate_keeps_detokenization_with_stop_strings():
+    client = _FakeClient()
+    for entry in client.choice["logprobs"]["content"]:
+        entry["top_logprobs"] = [{"token": entry["token"], "logprob": entry["logprob"]}]
+    asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={"score_centering_top_k": 4, "stop": ["</answer>"]},
+        )
+    )
+    assert "detokenize" not in client.calls[0]["body"]["sampling_params"]
+
+
+def test_generate_rejects_misaligned_packed_sampler_head():
+    client = _FakeClient()
+    client.choice["sampler_head"] = _packed_head([[(7, -0.1)]])
+    with pytest.raises(MalformedGenerateResponseError, match="does not align"):
+        _run_score_centering(client)
 
 
 def test_generate_rejects_vllm_missing_logprob_sentinel():

@@ -7,6 +7,7 @@ messages → Renderer.render_ids() → token IDs → POST /inference/v1/generate
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 import httpx
+import numpy as np
 from openai import AsyncOpenAI
 
 from renderers.base import (
@@ -134,6 +136,57 @@ def parse_generate_response(raw: bytes) -> dict[str, Any]:
     return payload
 
 
+def _sampler_head_rows(
+    choice: Mapping, completion_ids: list[int]
+) -> list[tuple[list[int], list[float]]]:
+    """Per-token (ids, logprobs) head rows, sampled token first.
+
+    Prefer the packed ``sampler_head`` a prime-rl server returns for requests with
+    ``extra_args["pack_sampler_head"]``; fall back to OpenAI-style ``top_logprobs``.
+    """
+    packed = choice.get("sampler_head")
+    if packed is not None:
+        try:
+            counts = np.frombuffer(base64.b64decode(packed["counts"]), dtype=np.int32)
+            ids = np.frombuffer(base64.b64decode(packed["ids"]), dtype=np.int32)
+            logps = np.frombuffer(
+                base64.b64decode(packed["logprobs"]), dtype=np.float32
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedGenerateResponseError(
+                "Malformed packed sampler head"
+            ) from exc
+        if (
+            len(counts) != len(completion_ids)
+            or (counts < 0).any()
+            or int(counts.sum()) != len(ids)
+            or len(ids) != len(logps)
+        ):
+            raise MalformedGenerateResponseError(
+                "Packed sampler head does not align with completion tokens"
+            )
+        bounds = np.cumsum(counts)[:-1]
+        return [
+            (row_ids.tolist(), row_logps.tolist())
+            for row_ids, row_logps in zip(
+                np.split(ids, bounds), np.split(logps, bounds)
+            )
+        ]
+    rows = []
+    for entry in choice["logprobs"]["content"]:
+        row_ids, row_logps = [], []
+        for alternative in entry.get("top_logprobs") or []:
+            token = alternative.get("token", "")
+            if not token.startswith("token_id:") or not token[9:].isdigit():
+                raise MalformedGenerateResponseError(
+                    "Sampler head must contain token_id:<integer> ids"
+                )
+            row_ids.append(int(token[9:]))
+            row_logps.append(alternative.get("logprob"))
+        rows.append((row_ids, row_logps))
+    return rows
+
+
 def _parse_sampler_head(
     choice: Mapping, completion_ids: list[int]
 ) -> tuple[list[list[int]], list[list[float]]]:
@@ -143,16 +196,11 @@ def _parse_sampler_head(
         raise MalformedGenerateResponseError(
             "Sampler head rows do not align with completion tokens"
         )
-    for entry in content:
+    for entry, (raw_ids, raw_logps) in zip(
+        content, _sampler_head_rows(choice, completion_ids)
+    ):
         row_ids, row_logps = [], []
-        for alternative in entry.get("top_logprobs") or []:
-            token = alternative.get("token", "")
-            if not token.startswith("token_id:") or not token[9:].isdigit():
-                raise MalformedGenerateResponseError(
-                    "Sampler head must contain token_id:<integer> ids"
-                )
-            token_id = int(token[9:])
-            lp = alternative.get("logprob")
+        for token_id, lp in zip(raw_ids, raw_logps):
             if (
                 isinstance(lp, bool)
                 or not isinstance(lp, (int, float))
@@ -160,7 +208,9 @@ def _parse_sampler_head(
                 or lp > 0
             ):
                 raise MalformedGenerateResponseError("Invalid sampler head logprob")
-            if lp == -math.inf:
+            # Tokens the sampler masked out (top-k/top-p) have processed logprob
+            # -inf, which vLLM serializes clamped to the sentinel.
+            if lp == -math.inf or lp <= VLLM_LOGPROB_SENTINEL:
                 continue
             if token_id in row_ids:
                 raise MalformedGenerateResponseError("Duplicate sampler head token id")
@@ -376,6 +426,13 @@ async def generate(
         raise ValueError("score_centering_top_k must be a positive integer")
     sp["logprobs"] = score_centering_top_k or 1
     sp.setdefault("skip_special_tokens", False)
+    if score_centering_top_k is not None:
+        # Ask a prime-rl server for the head as packed arrays; flat logprobs and no
+        # detokenization keep vLLM from building a Python object per alternative.
+        sp["flat_logprobs"] = True
+        sp["extra_args"] = {**(sp.get("extra_args") or {}), "pack_sampler_head": True}
+        if not sp.get("stop"):  # vLLM needs detokenization to match stop strings
+            sp.setdefault("detokenize", False)
 
     body: dict[str, Any] = {
         "model": model,
