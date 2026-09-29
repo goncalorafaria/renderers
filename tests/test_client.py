@@ -361,6 +361,7 @@ def _packed_head(rows):
     counts = np.array([len(r) for r in rows], dtype=np.int32)
     ids = np.array([i for r in rows for i, _ in r], dtype=np.int32)
     logps = np.array([lp for r in rows for _, lp in r], dtype=np.float32)
+
     def enc(a):
         return base64.b64encode(a.tobytes()).decode("ascii")
 
