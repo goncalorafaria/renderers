@@ -18,6 +18,7 @@ import httpx
 import numpy as np
 from openai import AsyncOpenAI
 
+from renderers import packed_heads as ph
 from renderers.base import (
     Message,
     MultiModalData,
@@ -141,37 +142,8 @@ def _sampler_head_rows(
 ) -> list[tuple[list[int], list[float]]]:
     """Per-token (ids, logprobs) head rows, sampled token first.
 
-    Prefer the packed ``sampler_head`` a prime-rl server returns for requests with
-    ``extra_args["pack_sampler_head"]``; fall back to OpenAI-style ``top_logprobs``.
+    Legacy OpenAI-style ``top_logprobs`` fallback; packed responses bypass this path.
     """
-    packed = choice.get("sampler_head")
-    if packed is not None:
-        try:
-            counts = np.frombuffer(base64.b64decode(packed["counts"]), dtype=np.int32)
-            ids = np.frombuffer(base64.b64decode(packed["ids"]), dtype=np.int32)
-            logps = np.frombuffer(
-                base64.b64decode(packed["logprobs"]), dtype=np.float32
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise MalformedGenerateResponseError(
-                "Malformed packed sampler head"
-            ) from exc
-        if (
-            len(counts) != len(completion_ids)
-            or (counts < 0).any()
-            or int(counts.sum()) != len(ids)
-            or len(ids) != len(logps)
-        ):
-            raise MalformedGenerateResponseError(
-                "Packed sampler head does not align with completion tokens"
-            )
-        bounds = np.cumsum(counts)[:-1]
-        return [
-            (row_ids.tolist(), row_logps.tolist())
-            for row_ids, row_logps in zip(
-                np.split(ids, bounds), np.split(logps, bounds)
-            )
-        ]
     rows = []
     for entry in choice["logprobs"]["content"]:
         row_ids, row_logps = [], []
@@ -189,9 +161,23 @@ def _sampler_head_rows(
 
 def _parse_sampler_head(
     choice: Mapping, completion_ids: list[int]
-) -> tuple[list[list[int]], list[list[float]]]:
-    ids, logps = [], []
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
     content = choice["logprobs"]["content"]
+    if choice.get("sampler_head") is not None:
+        if len(content) != len(completion_ids):
+            raise MalformedGenerateResponseError(
+                "Sampler head rows do not align with completion tokens"
+            )
+        try:
+            return ph.decode(
+                choice["sampler_head"],
+                completion_ids,
+                [entry["logprob"] for entry in content],
+                VLLM_LOGPROB_SENTINEL,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedGenerateResponseError(str(exc)) from exc
+    ids, logps = [], []
     if len(content) != len(completion_ids):
         raise MalformedGenerateResponseError(
             "Sampler head rows do not align with completion tokens"
@@ -239,7 +225,7 @@ def _parse_sampler_head(
             )
         ids.append(row_ids)
         logps.append(row_logps)
-    return ids, logps
+    return ph.pack(ids, np.int32), ph.pack(logps, np.float32)
 
 
 def _parse_completion_logprobs(
