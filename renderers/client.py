@@ -16,9 +16,10 @@ from typing import Any, cast
 
 import httpx
 import numpy as np
+from renderers import packed_heads as ph
 from openai import AsyncOpenAI
 
-from renderers import packed_heads as ph
+from renderers from renderers import packed_heads as ph
 from renderers.base import (
     Message,
     MultiModalData,
@@ -404,21 +405,31 @@ async def generate(
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
     score_centering_top_k = sp.pop("score_centering_top_k", None)
+    mc_samples = sp.pop("score_centering_samples", None)
+    if mc_samples is not None and (type(mc_samples) is not int or mc_samples != 32
+                                   or score_centering_top_k is not None):
+        raise ValueError("MC32 requires exactly 32 samples and no top-k head")
+
     if score_centering_top_k is not None and (
         isinstance(score_centering_top_k, bool)
         or not isinstance(score_centering_top_k, int)
         or score_centering_top_k < 1
     ):
         raise ValueError("score_centering_top_k must be a positive integer")
-    sp["logprobs"] = score_centering_top_k or 1
+    sp["logprobs"] = mc_samples or score_centering_top_k or 1
     sp.setdefault("skip_special_tokens", False)
-    if score_centering_top_k is not None:
+    if score_centering_top_k is not None or mc_samples is not None:
         # Ask a prime-rl server for the head as packed arrays; flat logprobs and no
         # detokenization keep vLLM from building a Python object per alternative.
         sp["flat_logprobs"] = True
         sp["extra_args"] = {**(sp.get("extra_args") or {}), "pack_sampler_head": True}
         if not sp.get("stop"):  # vLLM needs detokenization to match stop strings
             sp.setdefault("detokenize", False)
+
+    if mc_samples is not None:
+        if sp.get("stop") or sp.get("detokenize"):
+            raise ValueError("MC32 requires token stops and detokenize=False")
+        sp["extra_args"]["score_centering_samples"] = 32
 
     body: dict[str, Any] = {
         "model": model,
@@ -475,10 +486,14 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
     sampler_head_ids = sampler_head_logprobs = None
-    if score_centering_top_k is not None:
+    if score_centering_top_k is not None or mc_samples is not None:
         sampler_head_ids, sampler_head_logprobs = _parse_sampler_head(
             choice, completion_ids
         )
+        expected = b"mc32" if mc_samples is not None else b"topk"
+        if sampler_head_ids.get("mode", b"topk") != expected:
+            raise MalformedGenerateResponseError("Sampler response mode does not match request")
+
 
     parsed = renderer.parse_response(
         completion_ids,
