@@ -5,8 +5,6 @@ import json
 import httpx
 import numpy as np
 import pytest
-
-from renderers import MalformedGenerateResponseError
 from renderers.base import (
     ParsedResponse,
     ParsedToolCall,
@@ -14,6 +12,8 @@ from renderers.base import (
     ToolCallParseStatus,
 )
 from renderers.client import generate
+
+from renderers import MalformedGenerateResponseError, packed_heads
 
 
 class _FakeRenderer:
@@ -202,10 +202,12 @@ def test_generate_builds_request_body_and_parses_response(usage, score_centering
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["sampler_head_ids"] == (
-        [[7, 9], [8, 9]] if score_centering_top_k else None
+        packed_heads.pack([[7, 9], [8, 9]], np.int32) if score_centering_top_k else None
     )
     assert result["sampler_head_logprobs"] == (
-        [[-0.1, -3.0], [-0.2, -3.0]] if score_centering_top_k else None
+        packed_heads.pack([[-0.1, -3.0], [-0.2, -3.0]], np.float32)
+        if score_centering_top_k
+        else None
     )
     assert result["routed_experts"]["shape"] == [2, 1, 1]
     assert isinstance(result["routed_experts"]["data"], memoryview)
@@ -353,8 +355,10 @@ def test_generate_drops_masked_sampler_head_entries():
             sampling_params={"score_centering_top_k": 4},
         )
     )
-    assert result["sampler_head_ids"] == [[7, 9], [8, 9]]
-    assert result["sampler_head_logprobs"] == [[-0.1, -3.0], [-0.2, -3.0]]
+    assert result["sampler_head_ids"] == packed_heads.pack([[7, 9], [8, 9]], np.int32)
+    assert result["sampler_head_logprobs"] == packed_heads.pack(
+        [[-0.1, -3.0], [-0.2, -3.0]], np.float32
+    )
 
 
 def _packed_head(rows):
@@ -395,9 +399,11 @@ def test_generate_reads_packed_sampler_head():
         [[(7, -0.1), (9, -3.0)], [(8, -0.2), (9, -3.0)]]
     )
     result = _run_score_centering(client)
-    assert result["sampler_head_ids"] == [[7, 9], [8, 9]]
+    assert result["sampler_head_ids"] == packed_heads.pack([[7, 9], [8, 9]], np.int32)
     np.testing.assert_allclose(
-        result["sampler_head_logprobs"], [[-0.1, -3.0], [-0.2, -3.0]], rtol=1e-6
+        packed_heads.arrays(result["sampler_head_logprobs"], np.float32)[1],
+        [-0.1, -3.0, -0.2, -3.0],
+        rtol=1e-6,
     )
     sp = client.calls[0]["body"]["sampling_params"]
     assert sp["extra_args"] == {"pack_sampler_head": True}
@@ -590,7 +596,6 @@ def test_generate_serializes_multimodal_features_for_qwen_vl_family(
     pytest.importorskip("vllm", reason="vllm needed for features serialization")
 
     import torch as _torch
-
     from renderers.base import (
         MultiModalData,
         PlaceholderRange,
@@ -667,7 +672,6 @@ def test_generate_serializes_multimodal_features_for_gemma4():
     pytest.importorskip("vllm", reason="vllm needed for features serialization")
 
     import torch as _torch
-
     from renderers.base import MultiModalData, PlaceholderRange, load_tokenizer
     from renderers.gemma4 import Gemma4Renderer
 
@@ -725,14 +729,13 @@ def test_generate_serializes_nemotron_dynamic_image_features():
     pytest.importorskip("torch")
     pytest.importorskip("vllm", reason="vllm needed for features serialization")
 
+    from renderers.base import MultiModalData, PlaceholderRange
+    from renderers.nemotron3 import Nemotron35Renderer
     from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import (
         decode_mm_kwargs_item,
     )
     from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
     from vllm.multimodal.inputs import MultiModalKwargsItems
-
-    from renderers.base import MultiModalData, PlaceholderRange
-    from renderers.nemotron3 import Nemotron35Renderer
 
     class _FakeNemotronRenderer(Nemotron35Renderer):
         def get_stop_token_ids(self):
